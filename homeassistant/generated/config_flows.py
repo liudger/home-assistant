@@ -11,6 +11,7 @@ FLOWS = {
         "generic_thermostat",
         "group",
         "history_stats",
+        "home_ems",
         "integration",
         "min_max",
         "mold_indicator",

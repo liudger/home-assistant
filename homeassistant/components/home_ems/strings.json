@@ -1,0 +1,84 @@
+{
+  "config": {
+    "abort": {
+      "already_configured": "This device is already configured for energy optimization"
+    },
+    "error": {
+      "already_configured": "This device is already configured for optimization",
+      "invalid_device": "Selected device is not valid",
+      "invalid_heating_duration": "Heating duration must be greater than 0",
+      "invalid_price_entity": "Selected price sensor is not valid",
+      "invalid_temperature_range": "Minimum temperature must be lower than maximum temperature"
+    },
+    "step": {
+      "user": {
+        "description": "Optimize your heating schedule based on energy prices.",
+        "menu_options": {
+          "climate": "Thermostat / Heating (coming soon)",
+          "water_heater": "Hot Water Heater"
+        },
+        "title": "Add Energy Schedule Optimizer"
+      },
+      "water_heater": {
+        "data": {
+          "heating_duration": "Heating duration (hours) - used as fallback if temperature sensor unavailable",
+          "max_temperature": "Maximum temperature (°C)",
+          "min_shower_temperature": "Minimum acceptable temperature for use (°C)",
+          "min_temperature": "Minimum temperature (°C)",
+          "name": "Name for this optimizer",
+          "price_entity": "Energy price sensor (select 'Current price' for NordPool)",
+          "target_device": "Hot water heater device",
+          "target_time": "Time water should be ready",
+          "temperature_sensor": "Current temperature sensor (optional - auto-detected if not set)",
+          "update_time": "Daily schedule update time"
+        },
+        "description": "Set up energy price-based scheduling for your hot water heater.\n\n**For NordPool**: Select the 'Current price' sensor.\n**For Tibber**: Select the 'Electricity price' sensor.\n\n**Smart Heating**: The system learns your heater's behavior and dynamically calculates optimal heating times based on current temperature.",
+        "title": "Configure Hot Water Optimization"
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "estimated_cost": {
+        "name": "Estimated cost"
+      },
+      "last_update": {
+        "name": "Last schedule update"
+      },
+      "next_schedule_time": {
+        "name": "Next heating start"
+      },
+      "price_entity": {
+        "name": "Price entity"
+      },
+      "status": {
+        "name": "Status",
+        "state": {
+          "active": "Active",
+          "error": "Error",
+          "idle": "Idle"
+        }
+      },
+      "target_device": {
+        "name": "Target device"
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "heating_duration": "Heating duration (hours) - fallback value",
+          "max_temperature": "Maximum temperature (°C)",
+          "min_shower_temperature": "Minimum acceptable temperature for use (°C)",
+          "min_temperature": "Minimum temperature (°C)",
+          "price_entity": "Energy price sensor",
+          "target_time": "Time water should be ready",
+          "temperature_sensor": "Current temperature sensor (optional)",
+          "update_time": "Daily schedule update time"
+        },
+        "title": "Update Energy Optimization Settings"
+      }
+    }
+  }
+}

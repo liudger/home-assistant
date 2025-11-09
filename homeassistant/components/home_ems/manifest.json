@@ -1,0 +1,12 @@
+{
+  "domain": "home_ems",
+  "name": "Home Energy Management System",
+  "codeowners": ["@liudger"],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://www.home-assistant.io/integrations/home_ems",
+  "integration_type": "helper",
+  "iot_class": "calculated",
+  "quality_scale": "bronze",
+  "requirements": []
+}

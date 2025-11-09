@@ -7864,6 +7864,12 @@
       "config_flow": true,
       "iot_class": "local_polling"
     },
+    "home_ems": {
+      "name": "Home Energy Management System",
+      "integration_type": "helper",
+      "config_flow": true,
+      "iot_class": "calculated"
+    },
     "input_boolean": {
       "integration_type": "helper",
       "config_flow": false

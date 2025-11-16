@@ -64,9 +64,9 @@ async def get_water_heater_schema(handler: SchemaCommonFlowHandler) -> vol.Schem
     return vol.Schema(
         {
             vol.Required(CONF_NAME): selector.TextSelector(),
-            vol.Required(CONF_TARGET_DEVICE): selector.DeviceSelector(
-                selector.DeviceSelectorConfig(
-                    integration="bsblan",
+            vol.Required(CONF_TARGET_DEVICE): selector.EntitySelector(
+                selector.EntitySelectorConfig(
+                    domain="water_heater",
                     multiple=False,
                 )
             ),

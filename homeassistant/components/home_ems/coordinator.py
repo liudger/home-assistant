@@ -7,9 +7,10 @@ import logging
 import math
 from typing import TYPE_CHECKING, Any
 
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
@@ -61,6 +62,10 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._learned_cooling_rate: float | None = None
         self._temperature_history: list[tuple[datetime, float]] = []
 
+        # Debug logging to see what's in config entry
+        _LOGGER.debug("Config entry data: %s", config_entry.data)
+        _LOGGER.debug("Config entry options: %s", config_entry.options)
+
     @property
     def price_entity_id(self) -> str:
         """Return the price entity ID."""
@@ -68,10 +73,11 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return self.config_entry.options[CONF_PRICE_ENTITY]
 
     @property
-    def target_device_id(self) -> str:
-        """Return the target device ID."""
+    def target_entity_id(self) -> str:
+        """Return the target water heater entity ID."""
         assert self.config_entry is not None
-        return self.config_entry.data[CONF_TARGET_DEVICE]
+        # SchemaConfigFlowHandler stores everything in options, not data
+        return self.config_entry.options[CONF_TARGET_DEVICE]
 
     @property
     def target_time(self) -> str:
@@ -157,14 +163,19 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not self._next_schedule:
             return None
         try:
-            # Parse time string from schedule (format: "HH:MM")
-            time_str = next(iter(self._next_schedule.keys()))
-            hour, minute = map(int, time_str.split(":"))
+            # Get the first scheduled day's time range (format: "HH:MM-HH:MM")
+            # Schedule format: {'monday': '03:45-04:00'}
+            time_range = next(iter(self._next_schedule.values()))
+            # Extract start time from "HH:MM-HH:MM" format
+            start_time_str = time_range.split("-")[0]
+            time_parts = start_time_str.split(":")
+            hour = int(time_parts[0])
+            minute = int(time_parts[1])
             now = dt_util.now()
             schedule_time = now.replace(
                 hour=hour, minute=minute, second=0, microsecond=0
             )
-        except (ValueError, StopIteration) as err:
+        except (ValueError, StopIteration, IndexError) as err:
             _LOGGER.warning("Failed to parse schedule time: %s", err)
             return None
         else:
@@ -179,45 +190,41 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return self._last_schedule_update
 
     def _get_current_temperature(self) -> float | None:
-        """Get current water temperature from sensor."""
-        if not self.temperature_sensor_id:
-            # Try to find temperature sensor in device entities
-            temp_sensor = self._find_temperature_sensor()
-            if not temp_sensor:
-                _LOGGER.warning("No temperature sensor configured or found")
+        """Get current water temperature from water heater entity or configured sensor."""
+        # If user configured a specific temperature sensor, use that
+        if self.temperature_sensor_id:
+            state = self.hass.states.get(self.temperature_sensor_id)
+            if not state:
+                _LOGGER.warning(
+                    "Temperature sensor %s not found", self.temperature_sensor_id
+                )
                 return None
-        else:
-            temp_sensor = self.temperature_sensor_id
+            try:
+                return float(state.state)
+            except (ValueError, TypeError) as err:
+                _LOGGER.warning("Invalid temperature value from sensor: %s", err)
+                return None
 
-        state = self.hass.states.get(temp_sensor)
-        if not state:
-            _LOGGER.warning("Temperature sensor %s not found", temp_sensor)
+        # Otherwise, get current_temperature from water heater entity
+        entity_state = self.hass.states.get(self.target_entity_id)
+        if entity_state is None:
+            _LOGGER.warning("Water heater entity %s not found", self.target_entity_id)
+            return None
+
+        # Get current_temperature attribute from water heater
+        current_temp = entity_state.attributes.get("current_temperature")
+        if current_temp is None:
+            _LOGGER.debug(
+                "No current_temperature attribute on water heater %s",
+                self.target_entity_id,
+            )
             return None
 
         try:
-            return float(state.state)
+            return float(current_temp)
         except (ValueError, TypeError) as err:
-            _LOGGER.warning("Invalid temperature value: %s", err)
+            _LOGGER.warning("Invalid temperature value from water heater: %s", err)
             return None
-
-    def _find_temperature_sensor(self) -> str | None:
-        """Find temperature sensor for the water heater device."""
-        device_registry = dr.async_get(self.hass)
-        device_entry = device_registry.async_get(self.target_device_id)
-
-        if not device_entry:
-            return None
-
-        # Look for entities associated with this device
-        entity_registry = er.async_get(self.hass)
-        entities = er.async_entries_for_device(entity_registry, self.target_device_id)
-
-        # Find temperature sensor entity
-        for entity in entities:
-            if entity.domain == "sensor" and "temperature" in entity.entity_id.lower():
-                return entity.entity_id
-
-        return None
 
     def _update_temperature_history(self, temperature: float) -> None:
         """Update temperature history for learning heating/cooling rates."""
@@ -332,13 +339,15 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         update_time_str = self.update_time
 
-        # Parse update time
+        # Parse update time (handle both HH:MM and HH:MM:SS formats)
         try:
-            update_hour, update_minute = map(int, update_time_str.split(":"))
+            time_parts = update_time_str.split(":")
+            update_hour = int(time_parts[0])
+            update_minute = int(time_parts[1])
             today_update = now.replace(
                 hour=update_hour, minute=update_minute, second=0, microsecond=0
             )
-        except (ValueError, AttributeError) as err:
+        except (ValueError, AttributeError, IndexError) as err:
             _LOGGER.error("Invalid update time format: %s", update_time_str)
             raise UpdateFailed(f"Invalid update time: {err}") from err
 
@@ -422,80 +431,110 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not prices:
             return False
 
-        # Parse target time
+        # Parse target time (handle both HH:MM and HH:MM:SS formats)
         try:
-            target_hour, target_minute = map(int, self.target_time.split(":"))
-        except (ValueError, AttributeError):
+            time_parts = self.target_time.split(":")
+            target_hour = int(time_parts[0])
+            target_minute = int(time_parts[1])
+        except (ValueError, AttributeError, IndexError):
+            _LOGGER.error("Invalid target_time format: %s", self.target_time)
             return False
 
-        # Get target datetime (tomorrow if target time already passed today)
-        now = dt_util.now()
-        target_datetime = now.replace(
+        # Get target datetime in local time (user's configured time)
+        now_local = dt_util.now()
+        target_datetime_local = now_local.replace(
             hour=target_hour, minute=target_minute, second=0, microsecond=0
         )
-        if target_datetime <= now:
-            target_datetime += timedelta(days=1)
+        if target_datetime_local <= now_local:
+            target_datetime_local += timedelta(days=1)
+
+        # Convert to UTC for comparison with Nordpool prices (which are in UTC)
+        target_datetime_utc = dt_util.as_utc(target_datetime_local)
 
         # Check if we have price data up to target time
         latest_price_time = max(timestamp for timestamp, _ in prices)
-        return latest_price_time >= target_datetime
+
+        _LOGGER.info(
+            "Price data check: now_local=%s, target_local=%s, target_utc=%s, latest_price=%s, have_enough=%s",
+            now_local,
+            target_datetime_local,
+            target_datetime_utc,
+            latest_price_time,
+            latest_price_time >= target_datetime_utc,
+        )
+
+        return latest_price_time >= target_datetime_utc
 
     async def _get_price_data(self) -> list[tuple[datetime, float]]:
-        """Get price data from the price entity."""
-        price_entity = self.hass.states.get(self.price_entity_id)
-        if not price_entity:
-            _LOGGER.error("Price entity %s not found", self.price_entity_id)
-            return []
-
+        """Get price data from Nordpool integration."""
         prices: list[tuple[datetime, float]] = []
 
-        # Try to get prices from attributes (common for Tibber, NordPool)
-        # These integrations provide quarter-hourly data
-        if "today" in price_entity.attributes:
-            today_prices = price_entity.attributes["today"]
-            for entry in today_prices:
-                if isinstance(entry, dict) and "start" in entry and "value" in entry:
-                    timestamp = dt_util.parse_datetime(entry["start"])
-                    if timestamp:
-                        prices.append((timestamp, float(entry["value"])))
+        # Find Nordpool integration and get coordinator
+        nordpool_coordinator = None
+        nordpool_areas = None
+        for entry in self.hass.config_entries.async_entries("nordpool"):
+            if entry.state == ConfigEntryState.LOADED:
+                try:
+                    nordpool_coordinator = entry.runtime_data
+                    # Get the areas configured in Nordpool
+                    nordpool_areas = entry.data.get("areas", [])
+                    break
+                except AttributeError:
+                    _LOGGER.warning(
+                        "Nordpool entry %s has no runtime_data", entry.entry_id
+                    )
+                    continue
 
-        if "tomorrow" in price_entity.attributes:
-            tomorrow_prices = price_entity.attributes["tomorrow"]
-            for entry in tomorrow_prices:
-                if isinstance(entry, dict) and "start" in entry and "value" in entry:
-                    timestamp = dt_util.parse_datetime(entry["start"])
-                    if timestamp:
-                        prices.append((timestamp, float(entry["value"])))
+        if not nordpool_coordinator:
+            _LOGGER.error("Nordpool integration not found or not loaded")
+            return []
 
-        # Also try raw_today and raw_tomorrow (alternative attribute names)
-        if "raw_today" in price_entity.attributes:
-            raw_today = price_entity.attributes["raw_today"]
-            for entry in raw_today:
-                if isinstance(entry, dict) and "start" in entry and "value" in entry:
-                    timestamp = dt_util.parse_datetime(entry["start"])
-                    if timestamp:
-                        prices.append((timestamp, float(entry["value"])))
+        if not nordpool_areas:
+            _LOGGER.error("No areas configured in Nordpool integration")
+            return []
 
-        if "raw_tomorrow" in price_entity.attributes:
-            raw_tomorrow = price_entity.attributes["raw_tomorrow"]
-            for entry in raw_tomorrow:
-                if isinstance(entry, dict) and "start" in entry and "value" in entry:
-                    timestamp = dt_util.parse_datetime(entry["start"])
-                    if timestamp:
-                        prices.append((timestamp, float(entry["value"])))
+        # Use the first configured area (most installations have one area)
+        nordpool_area = (
+            nordpool_areas[0] if isinstance(nordpool_areas, list) else nordpool_areas
+        )
 
-        # If no attribute prices, log current price for debugging
+        # Get price entries from Nordpool coordinator
+        try:
+            price_entries = nordpool_coordinator.merge_price_entries()
+            _LOGGER.debug("Found %d price entries from Nordpool", len(price_entries))
+
+            for entry in price_entries:
+                # Each entry has: start, end, entry (dict with area prices)
+                if nordpool_area in entry.entry:
+                    timestamp = entry.start
+                    # Convert from öre/cent to main currency unit (kr/EUR)
+                    price = entry.entry[nordpool_area] / 1000
+                    prices.append((timestamp, price))
+
+            _LOGGER.info(
+                "Fetched %d price data points for area %s (15-min intervals)",
+                len(prices),
+                nordpool_area,
+            )
+
+            if prices:
+                earliest = min(ts for ts, _ in prices)
+                latest = max(ts for ts, _ in prices)
+                _LOGGER.info(
+                    "Price data range: %s to %s",
+                    earliest,
+                    latest,
+                )
+
+        except Exception:
+            _LOGGER.exception("Error fetching Nordpool data")
+            return []
+
         if not prices:
-            try:
-                current_price = float(price_entity.state)
-                _LOGGER.warning(
-                    "Price entity has no quarter-hourly data. Current price: %.2f",
-                    current_price,
-                )
-            except (ValueError, TypeError):
-                _LOGGER.error(
-                    "Could not get price data from entity %s", self.price_entity_id
-                )
+            _LOGGER.warning(
+                "No price data found for area %s. Check Nordpool integration",
+                nordpool_area,
+            )
 
         return prices
 
@@ -521,10 +560,12 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 required_quarters,
             )
 
-        # Parse target time
+        # Parse target time (handle both HH:MM and HH:MM:SS formats)
         try:
-            target_hour, target_minute = map(int, self.target_time.split(":"))
-        except (ValueError, AttributeError):
+            time_parts = self.target_time.split(":")
+            target_hour = int(time_parts[0])
+            target_minute = int(time_parts[1])
+        except (ValueError, AttributeError, IndexError):
             _LOGGER.error("Invalid target time format: %s", self.target_time)
             return None
 
@@ -889,31 +930,76 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return total_cost
 
     async def _apply_schedule_to_device(self, schedule: dict[str, str]) -> None:
-        """Apply the calculated schedule to the target device."""
-        # Get device information
-        device_registry = dr.async_get(self.hass)
-        device_entry = device_registry.async_get(self.target_device_id)
+        """Apply the calculated schedule to the target water heater entity."""
+        # Get entity information
+        entity_registry = er.async_get(self.hass)
+        entity_entry = entity_registry.async_get(self.target_entity_id)
 
-        if not device_entry:
+        if not entity_entry:
             raise HomeAssistantError(
-                f"Device {self.target_device_id} not found in registry"
+                f"Water heater entity {self.target_entity_id} not found in registry"
             )
 
-        _LOGGER.debug("Applying schedule to device %s: %s", device_entry.name, schedule)
+        _LOGGER.debug(
+            "Applying schedule to water heater %s: %s",
+            self.target_entity_id,
+            schedule,
+        )
+
+        # Get the device from the entity to call the service
+        if not entity_entry.device_id:
+            raise HomeAssistantError(
+                f"Water heater entity {self.target_entity_id} has no associated device"
+            )
 
         # Call BSBLan service to set hot water schedule
+        # Note: BSBLan API can only set one day at a time, so we need to make
+        # separate service calls for each day that has a schedule
         try:
-            await self.hass.services.async_call(
-                "bsblan",
-                "set_hot_water_schedule",
-                {
-                    "device": self.target_device_id,
-                    "schedule": schedule,
-                },
-                blocking=True,
-            )
+            # Map schedule days to service parameter names
+            day_mapping = {
+                "monday": "monday_slots",
+                "tuesday": "tuesday_slots",
+                "wednesday": "wednesday_slots",
+                "thursday": "thursday_slots",
+                "friday": "friday_slots",
+                "saturday": "saturday_slots",
+                "sunday": "sunday_slots",
+            }
+
+            # Make a separate service call for each day that has a schedule
+            for day, time_slot_str in schedule.items():
+                # Convert "HH:MM-HH:MM" string to dict format expected by BSBLan
+                # e.g., "03:45-04:00" -> {"start_time": "03:45", "end_time": "04:00"}
+                try:
+                    start_time, end_time = time_slot_str.split("-")
+                    time_slot_dict = {
+                        "start_time": start_time,
+                        "end_time": end_time,
+                    }
+                except ValueError:
+                    _LOGGER.error("Invalid time slot format: %s", time_slot_str)
+                    continue
+
+                service_data = {
+                    "device_id": entity_entry.device_id,
+                    day_mapping[day]: [
+                        time_slot_dict
+                    ],  # BSBLan expects a list of dicts
+                }
+
+                _LOGGER.debug("Setting %s schedule: %s", day, time_slot_dict)
+
+                await self.hass.services.async_call(
+                    "bsblan",
+                    "set_hot_water_schedule",
+                    service_data,
+                    blocking=True,
+                )
+
             _LOGGER.info(
-                "Successfully applied schedule to device %s", device_entry.name
+                "Successfully applied schedule to water heater %s",
+                self.target_entity_id,
             )
         except Exception as err:
             _LOGGER.error("Failed to apply schedule: %s", err)

@@ -51,7 +51,7 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             hass,
             _LOGGER,
             name=f"{DOMAIN}_{config_entry.entry_id}",
-            update_interval=timedelta(hours=1),  # Check hourly
+            update_interval=timedelta(minutes=15),  # Check every 15 minutes
             config_entry=config_entry,
         )
         self.config_entry = config_entry
@@ -189,6 +189,37 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Return the last update timestamp."""
         return self._last_schedule_update
 
+    def _is_currently_heating(self) -> bool:
+        """Check if we're currently within the scheduled heating window."""
+        if not self._next_schedule:
+            return False
+
+        try:
+            # Parse schedule time range (format: "HH:MM-HH:MM")
+            time_range = next(iter(self._next_schedule.values()))
+            start_str, end_str = time_range.split("-")
+
+            # Parse start and end times
+            start_parts = start_str.split(":")
+            end_parts = end_str.split(":")
+            start_hour, start_min = int(start_parts[0]), int(start_parts[1])
+            end_hour, end_min = int(end_parts[0]), int(end_parts[1])
+
+            now = dt_util.now()
+            # Create datetime objects for comparison
+            start_time = now.replace(
+                hour=start_hour, minute=start_min, second=0, microsecond=0
+            )
+            end_time = now.replace(
+                hour=end_hour, minute=end_min, second=0, microsecond=0
+            )
+        except (ValueError, StopIteration, IndexError) as err:
+            _LOGGER.debug("Failed to parse schedule for heating check: %s", err)
+            return False
+        else:
+            # Check if current time is within heating window
+            return start_time <= now <= end_time
+
     def _get_current_temperature(self) -> float | None:
         """Get current water temperature from water heater entity or configured sensor."""
         # If user configured a specific temperature sensor, use that
@@ -208,7 +239,16 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Otherwise, get current_temperature from water heater entity
         entity_state = self.hass.states.get(self.target_entity_id)
         if entity_state is None:
-            _LOGGER.warning("Water heater entity %s not found", self.target_entity_id)
+            # Use debug level if this is first run (entity may not be ready yet)
+            if self._last_schedule_update is None:
+                _LOGGER.debug(
+                    "Water heater entity %s not found (may not be loaded yet)",
+                    self.target_entity_id,
+                )
+            else:
+                _LOGGER.warning(
+                    "Water heater entity %s not found", self.target_entity_id
+                )
             return None
 
         # Get current_temperature attribute from water heater
@@ -295,17 +335,45 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._learned_cooling_rate = median_rate
             _LOGGER.info("Learned cooling rate: %.1f°C/hour", median_rate)
 
-    def _calculate_required_quarters(self, current_temp: float) -> int:
+    def _calculate_required_quarters(
+        self, current_temp: float, heating_start_time: datetime | None = None
+    ) -> int:
         """Calculate required heating quarters based on current temperature.
 
         Args:
             current_temp: Current water temperature
+            heating_start_time: When heating will start (to account for cooling before heating)
 
         Returns:
             Number of quarter-hour periods needed
         """
+        # If heating start time is provided, calculate temperature at that time
+        # (accounting for cooling between now and heating start)
+        if heating_start_time:
+            now = dt_util.now()
+            time_until_heating = (
+                heating_start_time - now
+            ).total_seconds() / 3600  # hours
+            if time_until_heating > 0:
+                # Water will cool down before heating starts
+                temp_drop = time_until_heating * self.cooling_rate
+                temp_at_heating_start = max(
+                    self.min_temperature, current_temp - temp_drop
+                )
+                _LOGGER.debug(
+                    "Temperature will drop %.1f°C (from %.1f°C to %.1f°C) before heating starts at %s",
+                    temp_drop,
+                    current_temp,
+                    temp_at_heating_start,
+                    heating_start_time,
+                )
+            else:
+                temp_at_heating_start = current_temp
+        else:
+            temp_at_heating_start = current_temp
+
         target_temp = self.max_temperature
-        temp_increase_needed = target_temp - current_temp
+        temp_increase_needed = target_temp - temp_at_heating_start
 
         if temp_increase_needed <= 0:
             return 0
@@ -317,13 +385,107 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         required_quarters = max(1, int(heating_time_hours * 4) + 1)
 
         _LOGGER.debug(
-            "Temperature rise needed: %.1f°C, heating time: %.2f hours, quarters: %d",
+            "Temperature rise needed: %.1f°C (from %.1f°C at heating start), heating time: %.2f hours, quarters: %d",
             temp_increase_needed,
+            temp_at_heating_start,
             heating_time_hours,
             required_quarters,
         )
 
         return required_quarters
+
+    def _should_recalculate_schedule(
+        self, current_temp: float | None, now: datetime
+    ) -> bool:
+        """Check if schedule should be recalculated based on temperature deviation.
+
+        Args:
+            current_temp: Current water temperature
+            now: Current datetime
+
+        Returns:
+            True if schedule should be recalculated
+        """
+        if not self._next_schedule or current_temp is None:
+            return False
+
+        # Don't recalculate if heating is currently active
+        # Exception: still recalculate if temperature deviation is large
+        if self._is_currently_heating():
+            # Calculate temperature deviation if we have history
+            if self._last_schedule_update:
+                hours_since_last_update = (
+                    now - self._last_schedule_update
+                ).total_seconds() / 3600
+                expected_temp_drop = hours_since_last_update * self.cooling_rate
+
+                last_update_temp = None
+                for ts, temp in reversed(self._temperature_history):
+                    if (
+                        abs((ts - self._last_schedule_update).total_seconds()) < 300
+                    ):  # Within 5 min
+                        last_update_temp = temp
+                        break
+
+                if last_update_temp:
+                    expected_temp = last_update_temp - expected_temp_drop
+                    temp_deviation = abs(current_temp - expected_temp)
+
+                    # Only recalculate during heating if deviation is extreme (>5°C)
+                    if temp_deviation > 5.0:
+                        _LOGGER.warning(
+                            "Extreme temperature deviation during heating: "
+                            "expected %.1f°C, actual %.1f°C (%.1f°C difference). Recalculating",
+                            expected_temp,
+                            current_temp,
+                            temp_deviation,
+                        )
+                        return True
+
+            _LOGGER.debug(
+                "Skipping recalculation - heating currently active according to schedule"
+            )
+            return False
+
+        # Don't recalculate if we just updated recently (within last 15 minutes)
+        if self._last_schedule_update:
+            minutes_since_update = (
+                now - self._last_schedule_update
+            ).total_seconds() / 60
+            if minutes_since_update < 15:
+                return False
+
+        # Calculate expected temperature based on last schedule calculation
+        if self._last_schedule_update:
+            hours_since_last_update = (
+                now - self._last_schedule_update
+            ).total_seconds() / 3600
+            expected_temp_drop = hours_since_last_update * self.cooling_rate
+
+            # Get temperature at last update from history
+            last_update_temp = None
+            for ts, temp in reversed(self._temperature_history):
+                if (
+                    abs((ts - self._last_schedule_update).total_seconds()) < 300
+                ):  # Within 5 min
+                    last_update_temp = temp
+                    break
+
+            if last_update_temp:
+                expected_temp = last_update_temp - expected_temp_drop
+                temp_deviation = abs(current_temp - expected_temp)
+
+                # Recalculate if temperature deviated more than 2°C from expected
+                if temp_deviation > 2.0:
+                    _LOGGER.info(
+                        "Temperature deviation detected: expected %.1f°C, actual %.1f°C (%.1f°C difference)",
+                        expected_temp,
+                        current_temp,
+                        temp_deviation,
+                    )
+                    return True
+
+        return False
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from price entity and calculate optimal schedule."""
@@ -363,6 +525,9 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         ):
             should_update = True
             _LOGGER.debug("Daily update time reached - will recalculate schedule")
+        elif self._should_recalculate_schedule(current_temp, now):
+            should_update = True
+            _LOGGER.info("Temperature deviation detected - will recalculate schedule")
 
         if should_update:
             try:
@@ -371,11 +536,18 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self._last_schedule_update = now
                 else:
                     _LOGGER.info(
-                        "Price data not yet available, will retry on next update"
+                        "Dependencies not yet ready, will retry on next update"
                     )
             except Exception as err:
-                _LOGGER.exception("Failed to calculate/apply schedule")
-                raise UpdateFailed(f"Schedule calculation failed: {err}") from err
+                # Don't fail on first run if dependencies aren't ready yet
+                if self._last_schedule_update is None:
+                    _LOGGER.info(
+                        "Failed to calculate schedule on first run (dependencies may not be ready): %s",
+                        err,
+                    )
+                else:
+                    _LOGGER.exception("Failed to calculate/apply schedule")
+                    raise UpdateFailed(f"Schedule calculation failed: {err}") from err
 
         return {
             "status": "active" if self._next_schedule else "idle",
@@ -395,7 +567,13 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Get price data
         prices = await self._get_price_data()
         if not prices:
-            _LOGGER.warning("No price data available yet")
+            # Use debug level if this is first run
+            if self._last_schedule_update is None:
+                _LOGGER.debug(
+                    "No price data available yet (dependencies may not be loaded)"
+                )
+            else:
+                _LOGGER.warning("No price data available yet")
             return False
 
         # Check if we have sufficient price data (need data until target time)
@@ -486,7 +664,11 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     continue
 
         if not nordpool_coordinator:
-            _LOGGER.error("Nordpool integration not found or not loaded")
+            # Use debug level if this is first run (integration may not be loaded yet)
+            if self._last_schedule_update is None:
+                _LOGGER.debug("Nordpool integration not found or not loaded yet")
+            else:
+                _LOGGER.error("Nordpool integration not found or not loaded")
             return []
 
         if not nordpool_areas:
@@ -541,7 +723,11 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _find_cheapest_window(
         self, prices: list[tuple[datetime, float]]
     ) -> tuple[datetime, datetime] | None:
-        """Find the cheapest heating window with dynamic quarter calculation."""
+        """Find the cheapest heating window with dynamic quarter calculation.
+
+        This accounts for temperature drop between now and heating start time.
+        Uses iterative approach since heating duration depends on start time (due to cooling).
+        """
         if not prices:
             return None
 
@@ -550,14 +736,13 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if current_temp is None:
             _LOGGER.warning("Cannot get current temperature, using fixed duration")
             required_quarters = max(1, int(self.heating_duration * 4))
+            use_fixed_duration = True
         else:
-            # Calculate required quarters dynamically based on current temp
-            required_quarters = self._calculate_required_quarters(current_temp)
+            use_fixed_duration = False
             _LOGGER.info(
-                "Current temp: %.1f°C, target: %.1f°C, required quarters: %d",
+                "Current temp: %.1f°C, target: %.1f°C",
                 current_temp,
                 self.max_temperature,
-                required_quarters,
             )
 
         # Parse target time (handle both HH:MM and HH:MM:SS formats)
@@ -586,11 +771,84 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         max_cooling_time_hours = (target_heat_temp - min_end_temp) / self.cooling_rate
         latest_heating_end = target_datetime - timedelta(hours=max_cooling_time_hours)
 
-        # Heating must start before this time
-        heating_duration_hours = required_quarters * 0.25
+        # Initial calculation of heating duration
+        if use_fixed_duration:
+            # Use fixed duration if we can't measure temperature
+            heating_duration_hours = self.heating_duration
+            required_quarters = max(1, int(heating_duration_hours * 4))
+        else:
+            # Calculate based on current temperature
+            assert current_temp is not None
+            required_quarters = self._calculate_required_quarters(current_temp)
+            heating_duration_hours = required_quarters * 0.25
+
         latest_heating_start = latest_heating_end - timedelta(
             hours=heating_duration_hours
         )
+
+        # Check if latest heating start is in the past
+        # This means we're running late - need to heat ASAP to reach target temp
+        running_late = False
+        if latest_heating_start <= now:
+            _LOGGER.warning(
+                "Running late! Latest heating start (%s) has passed. "
+                "Will find cheapest window in remaining time before target",
+                latest_heating_start,
+            )
+            running_late = True
+            # Use target time as the absolute deadline
+            latest_heating_start = target_datetime - timedelta(
+                hours=heating_duration_hours
+            )
+
+            # If even that is in the past, we can't reach target temp in time
+            if latest_heating_start <= now:
+                _LOGGER.error(
+                    "Cannot reach target temperature by %s. "
+                    "Not enough time remaining (need %.1f hours)",
+                    target_datetime,
+                    heating_duration_hours,
+                )
+                return None
+
+        if not use_fixed_duration and not running_late:
+            # Iterative approach to find optimal window accounting for pre-heating cooling
+            # Start with initial estimate based on current temperature
+            # current_temp is guaranteed to be not None here due to use_fixed_duration check
+            assert current_temp is not None
+            required_quarters = self._calculate_required_quarters(current_temp)
+            heating_duration_hours = required_quarters * 0.25
+            latest_heating_start = latest_heating_end - timedelta(
+                hours=heating_duration_hours
+            )
+
+            # Filter prices that are within valid window
+            valid_prices = [
+                (timestamp, price)
+                for timestamp, price in prices
+                if now <= timestamp <= latest_heating_start
+            ]
+
+            if valid_prices:
+                # Sort by price to find cheapest start time
+                valid_prices.sort(key=lambda x: x[1])
+
+                # Get the cheapest start time and recalculate quarters accounting for cooling
+                cheapest_start = valid_prices[0][0]
+                required_quarters = self._calculate_required_quarters(
+                    current_temp, cheapest_start
+                )
+
+                # Recalculate latest start with updated duration
+                heating_duration_hours = required_quarters * 0.25
+                latest_heating_start = latest_heating_end - timedelta(
+                    hours=heating_duration_hours
+                )
+
+                _LOGGER.info(
+                    "Required quarters: %d (accounting for pre-heating cooling)",
+                    required_quarters,
+                )
 
         _LOGGER.debug(
             "Latest heating start: %s, end: %s (allows %.1f°C cooling to target time)",
@@ -600,10 +858,14 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
         # Filter prices that are within valid window
+        # Important: price timestamps are in UTC, so convert now to UTC for comparison
+        now_utc = dt_util.as_utc(now)
+        latest_heating_start_utc = dt_util.as_utc(latest_heating_start)
+
         valid_prices = [
             (timestamp, price)
             for timestamp, price in prices
-            if now <= timestamp <= latest_heating_start
+            if now_utc <= timestamp <= latest_heating_start_utc
         ]
 
         if not valid_prices:
@@ -612,14 +874,29 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             return None
 
+        _LOGGER.debug(
+            "Found %d valid price windows between %s and %s",
+            len(valid_prices),
+            now_utc,
+            latest_heating_start_utc,
+        )
+
         # Sort by price
         valid_prices.sort(key=lambda x: x[1])
 
         # Try to find best consecutive window
-        # (required_quarters already calculated above based on current temperature)
+        # Need to sort by time for consecutive window search
+        prices_by_time = sorted(valid_prices, key=lambda x: x[0])
         consecutive_window = self._find_consecutive_window(
-            valid_prices, required_quarters
+            prices_by_time, required_quarters
         )
+
+        if consecutive_window:
+            _LOGGER.debug(
+                "Found consecutive window: %s to %s",
+                consecutive_window[0],
+                consecutive_window[1],
+            )
 
         # Try to find non-consecutive cheapest quarters
         non_consecutive_quarters = valid_prices[:required_quarters]
@@ -889,27 +1166,34 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Build schedule dict for DHW service."""
         start_time, end_time = window
 
+        # Convert UTC times to local timezone for the schedule
+        # (BSBLan operates in local time)
+        start_time_local = dt_util.as_local(start_time)
+        end_time_local = dt_util.as_local(end_time)
+
         # Format: "HH:MM-HH:MM"
-        time_range = f"{start_time.strftime('%H:%M')}-{end_time.strftime('%H:%M')}"
+        time_range = (
+            f"{start_time_local.strftime('%H:%M')}-{end_time_local.strftime('%H:%M')}"
+        )
 
         # Determine which day(s) the schedule applies to
         schedule: dict[str, str] = {}
 
-        current_date = start_time.date()
-        end_date = end_time.date()
+        current_date = start_time_local.date()
+        end_date = end_time_local.date()
 
         # Handle schedule spanning multiple days
         if current_date == end_date:
-            day_name = start_time.strftime("%A").lower()
+            day_name = start_time_local.strftime("%A").lower()
             schedule[day_name] = time_range
         else:
             # Start day gets start time to midnight
-            day_name = start_time.strftime("%A").lower()
-            schedule[day_name] = f"{start_time.strftime('%H:%M')}-23:59"
+            day_name = start_time_local.strftime("%A").lower()
+            schedule[day_name] = f"{start_time_local.strftime('%H:%M')}-23:59"
 
             # End day gets midnight to end time
-            day_name = end_time.strftime("%A").lower()
-            schedule[day_name] = f"00:00-{end_time.strftime('%H:%M')}"
+            day_name = end_time_local.strftime("%A").lower()
+            schedule[day_name] = f"00:00-{end_time_local.strftime('%H:%M')}"
 
         return schedule
 

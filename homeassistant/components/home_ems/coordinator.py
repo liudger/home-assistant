@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 import logging
-import math
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.config_entries import ConfigEntryState
@@ -24,12 +23,21 @@ from .const import (
     CONF_TARGET_TIME,
     CONF_TEMPERATURE_SENSOR,
     CONF_UPDATE_TIME,
-    DEFAULT_BASE_ENERGY,
     DEFAULT_COOLING_RATE,
-    DEFAULT_ENERGY_PER_DEGREE,
     DEFAULT_HEATING_RATE,
     DEFAULT_MIN_SHOWER_TEMPERATURE,
     DOMAIN,
+)
+from .models import (
+    HeatingConstraints,
+    HeatingWindow,
+    build_schedule,
+    calculate_cost,
+    calculate_required_quarters,
+    calculate_true_cost,
+    find_consecutive_window,
+    find_topup_quarter,
+    has_significant_gaps,
 )
 
 if TYPE_CHECKING:
@@ -588,11 +596,11 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return False
 
         # Build schedule
-        schedule = self._build_schedule(optimal_window)
+        schedule = build_schedule(optimal_window)
         self._next_schedule = schedule
 
         # Calculate estimated cost
-        self._estimated_cost = self._calculate_cost(prices, optimal_window)
+        self._estimated_cost = calculate_cost(prices, optimal_window)
 
         # Apply schedule to device
         await self._apply_schedule_to_device(schedule)
@@ -722,7 +730,7 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def _find_cheapest_window(
         self, prices: list[tuple[datetime, float]]
-    ) -> tuple[datetime, datetime] | None:
+    ) -> HeatingWindow | None:
         """Find the cheapest heating window with dynamic quarter calculation.
 
         This accounts for temperature drop between now and heating start time.
@@ -730,6 +738,14 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         if not prices:
             return None
+
+        constraints = HeatingConstraints(
+            min_temperature=self.min_temperature,
+            max_temperature=self.max_temperature,
+            min_shower_temperature=self.min_shower_temperature,
+            heating_rate=self.heating_rate,
+            cooling_rate=self.cooling_rate,
+        )
 
         # Get current temperature to calculate required heating
         current_temp = self._get_current_temperature()
@@ -779,7 +795,10 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         else:
             # Calculate based on current temperature
             assert current_temp is not None
-            required_quarters = self._calculate_required_quarters(current_temp)
+            required_quarters = calculate_required_quarters(
+                current_temp,
+                constraints,
+            )
             heating_duration_hours = required_quarters * 0.25
 
         latest_heating_start = latest_heating_end - timedelta(
@@ -816,7 +835,10 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Start with initial estimate based on current temperature
             # current_temp is guaranteed to be not None here due to use_fixed_duration check
             assert current_temp is not None
-            required_quarters = self._calculate_required_quarters(current_temp)
+            required_quarters = calculate_required_quarters(
+                current_temp,
+                constraints,
+            )
             heating_duration_hours = required_quarters * 0.25
             latest_heating_start = latest_heating_end - timedelta(
                 hours=heating_duration_hours
@@ -835,8 +857,10 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
                 # Get the cheapest start time and recalculate quarters accounting for cooling
                 cheapest_start = valid_prices[0][0]
-                required_quarters = self._calculate_required_quarters(
-                    current_temp, cheapest_start
+                required_quarters = calculate_required_quarters(
+                    current_temp,
+                    constraints,
+                    heating_start_time=cheapest_start,
                 )
 
                 # Recalculate latest start with updated duration
@@ -887,33 +911,32 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Try to find best consecutive window
         # Need to sort by time for consecutive window search
         prices_by_time = sorted(valid_prices, key=lambda x: x[0])
-        consecutive_window = self._find_consecutive_window(
-            prices_by_time, required_quarters
-        )
+        consecutive_window = find_consecutive_window(prices_by_time, required_quarters)
 
         if consecutive_window:
             _LOGGER.debug(
                 "Found consecutive window: %s to %s",
-                consecutive_window[0],
-                consecutive_window[1],
+                consecutive_window.start,
+                consecutive_window.end,
             )
 
         # Try to find non-consecutive cheapest quarters
         non_consecutive_quarters = valid_prices[:required_quarters]
 
         # Smart decision: compare true costs including heat loss
-        if consecutive_window and self._has_significant_gaps(non_consecutive_quarters):
-            consecutive_cost = self._calculate_true_cost(
+        if consecutive_window and has_significant_gaps(non_consecutive_quarters):
+            consecutive_cost = calculate_true_cost(
                 [
                     valid_prices[i]
                     for i in range(len(valid_prices))
-                    if valid_prices[i][0] >= consecutive_window[0]
-                    and valid_prices[i][0] < consecutive_window[1]
+                    if consecutive_window.start
+                    <= valid_prices[i][0]
+                    < consecutive_window.end
                 ],
                 is_consecutive=True,
             )
 
-            non_consecutive_cost = self._calculate_true_cost(
+            non_consecutive_cost = calculate_true_cost(
                 non_consecutive_quarters,
                 is_consecutive=False,
             )
@@ -931,11 +954,17 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     consecutive_cost - non_consecutive_cost,
                 )
                 timestamps = sorted(t for t, _ in non_consecutive_quarters)
-                base_window = (timestamps[0], timestamps[-1] + timedelta(minutes=15))
+                base_window = HeatingWindow(
+                    timestamps[0], timestamps[-1] + timedelta(minutes=15)
+                )
 
                 # Check if we need a top-up quarter to prevent excessive cooling
-                topup_window = self._find_topup_quarter(
-                    base_window, prices, target_datetime, current_temp
+                topup_window = find_topup_quarter(
+                    base_window,
+                    prices=prices,
+                    target_datetime=target_datetime,
+                    constraints=constraints,
+                    current_temp=current_temp,
                 )
                 return topup_window if topup_window else base_window
 
@@ -949,269 +978,22 @@ class HomeEMSCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Fallback: use cheapest quarters even if not consecutive
         _LOGGER.info("No consecutive window found, using cheapest quarters")
         timestamps = sorted(t for t, _ in non_consecutive_quarters)
-        base_window = (timestamps[0], timestamps[-1] + timedelta(minutes=15))
+        base_window = HeatingWindow(
+            timestamps[0], timestamps[-1] + timedelta(minutes=15)
+        )
 
         # Check if we need a top-up quarter to prevent excessive cooling
-        topup_window = self._find_topup_quarter(
-            base_window, prices, target_datetime, current_temp
+        topup_window = find_topup_quarter(
+            base_window,
+            prices=prices,
+            target_datetime=target_datetime,
+            constraints=constraints,
+            current_temp=current_temp,
         )
         if topup_window:
             return topup_window
 
         return base_window
-
-    def _find_topup_quarter(
-        self,
-        base_window: tuple[datetime, datetime],
-        prices: list[tuple[datetime, float]],
-        target_datetime: datetime,
-        current_temp: float | None,
-    ) -> tuple[datetime, datetime] | None:
-        """Find if a top-up quarter is needed to prevent temperature drop below minimum.
-
-        Args:
-            base_window: The initially scheduled heating window (start, end)
-            prices: All available price data
-            target_datetime: When the water needs to be ready
-            current_temp: Current water temperature
-
-        Returns:
-            Modified window with top-up quarter if needed, or None if no top-up needed
-        """
-        if current_temp is None:
-            return None
-
-        # Calculate expected temperature at target time
-        heating_end = base_window[1]
-        cooling_duration = (target_datetime - heating_end).total_seconds() / 3600
-        temp_drop = cooling_duration * self.cooling_rate
-        final_temp = self.max_temperature - temp_drop
-
-        # Check if temperature will drop below minimum
-        if final_temp >= self.min_shower_temperature:
-            _LOGGER.debug(
-                "No top-up needed: final temp %.1f°C >= min %.1f°C",
-                final_temp,
-                self.min_shower_temperature,
-            )
-            return None
-
-        # Temperature will be too low - need a top-up quarter
-        temp_deficit = self.min_shower_temperature - final_temp
-        _LOGGER.info(
-            "Top-up needed: final temp %.1f°C < min %.1f°C (deficit: %.1f°C)",
-            final_temp,
-            self.min_shower_temperature,
-            temp_deficit,
-        )
-
-        # Calculate how many quarters we need to add
-        # Each quarter adds heating_rate/4 degrees
-        temp_per_quarter = self.heating_rate / 4
-        topup_quarters = max(1, math.ceil(temp_deficit / temp_per_quarter))
-
-        _LOGGER.debug(
-            "Need %d top-up quarter(s) to add %.1f°C",
-            topup_quarters,
-            topup_quarters * temp_per_quarter,
-        )
-
-        # Find the cheapest quarters between heating_end and target_time
-        # These quarters will provide a last-minute boost
-        available_topup = [
-            (timestamp, price)
-            for timestamp, price in prices
-            if heating_end <= timestamp < target_datetime - timedelta(minutes=15)
-        ]
-
-        if len(available_topup) < topup_quarters:
-            _LOGGER.warning(
-                "Not enough time slots for top-up heating (need %d, have %d)",
-                topup_quarters,
-                len(available_topup),
-            )
-            # Return the best we can do
-            if not available_topup:
-                return None
-            topup_quarters = len(available_topup)
-
-        # Sort by price and take the cheapest
-        available_topup.sort(key=lambda x: x[1])
-        selected_topup = available_topup[:topup_quarters]
-
-        # Get all timestamps (base + topup)
-        all_timestamps = sorted([base_window[0]] + [t for t, _ in selected_topup])
-
-        _LOGGER.info(
-            "Adding %d top-up quarter(s) at %s (avg price: %.3f)",
-            topup_quarters,
-            ", ".join(t.strftime("%H:%M") for t, _ in selected_topup),
-            sum(p for _, p in selected_topup) / len(selected_topup),
-        )
-
-        # Return extended window covering base heating + top-up
-        return (base_window[0], all_timestamps[-1] + timedelta(minutes=15))
-
-    def _find_consecutive_window(
-        self,
-        valid_prices: list[tuple[datetime, float]],
-        required_quarters: int,
-    ) -> tuple[datetime, datetime] | None:
-        """Find the best consecutive heating window."""
-        best_window = None
-        best_avg_price = math.inf
-
-        for i in range(len(valid_prices) - required_quarters + 1):
-            window_prices = valid_prices[i : i + required_quarters]
-
-            # Check if periods are consecutive (quarters are 15 minutes = 900 seconds)
-            timestamps = [t for t, _ in window_prices]
-            timestamps.sort()
-
-            is_consecutive = True
-            for j in range(len(timestamps) - 1):
-                time_diff = (timestamps[j + 1] - timestamps[j]).total_seconds()
-                # Allow up to 900 seconds (15 minutes) between consecutive quarters
-                if time_diff > 900:
-                    is_consecutive = False
-                    break
-
-            if is_consecutive:
-                avg_price = sum(p for _, p in window_prices) / len(window_prices)
-                if avg_price < best_avg_price:
-                    best_avg_price = avg_price
-                    # End time is last quarter start + 15 minutes
-                    best_window = (
-                        timestamps[0],
-                        timestamps[-1] + timedelta(minutes=15),
-                    )
-
-        return best_window
-
-    def _has_significant_gaps(self, quarters: list[tuple[datetime, float]]) -> bool:
-        """Check if there are significant gaps between quarters."""
-        timestamps = sorted(t for t, _ in quarters)
-
-        for i in range(len(timestamps) - 1):
-            gap_seconds = (timestamps[i + 1] - timestamps[i]).total_seconds()
-            # Gap longer than 15 minutes (not consecutive)
-            if gap_seconds > 900:
-                return True
-
-        return False
-
-    def _calculate_true_cost(
-        self,
-        quarters: list[tuple[datetime, float]],
-        is_consecutive: bool,
-    ) -> float:
-        """Calculate true cost including heat loss penalty for gaps.
-
-        Args:
-            quarters: List of (timestamp, price) tuples
-            is_consecutive: Whether quarters are consecutive
-
-        Returns:
-            Total cost in currency units
-        """
-        if not quarters:
-            return math.inf
-
-        # Base cost: sum of prices * base energy
-        price_sum = sum(price for _, price in quarters)
-        base_cost = price_sum * DEFAULT_BASE_ENERGY / len(quarters)
-
-        if is_consecutive:
-            return base_cost
-
-        # Calculate heat loss penalty for gaps
-        timestamps = sorted(t for t, _ in quarters)
-        prices_dict = dict(quarters)
-
-        heat_loss_penalty = 0.0
-
-        for i in range(len(timestamps) - 1):
-            gap_seconds = (timestamps[i + 1] - timestamps[i]).total_seconds()
-
-            # Only penalize gaps longer than 15 minutes
-            if gap_seconds > 900:
-                gap_hours = (gap_seconds - 900) / 3600  # Subtract the normal 15 min
-
-                # Only penalize if gap exceeds comfort threshold
-                if gap_hours > 0:
-                    # Calculate temperature drop during gap
-                    temp_drop = min(gap_hours * DEFAULT_COOLING_RATE, 5.0)  # Cap at 5°C
-
-                    # Calculate extra energy needed to compensate
-                    extra_energy = temp_drop * DEFAULT_ENERGY_PER_DEGREE
-
-                    # Price for reheating (use price after the gap)
-                    reheat_price = prices_dict.get(
-                        timestamps[i + 1], price_sum / len(quarters)
-                    )
-
-                    penalty = extra_energy * reheat_price
-                    heat_loss_penalty += penalty
-
-                    _LOGGER.debug(
-                        "Gap detected: %.1f hours, temp drop: %.1f°C, penalty: %.2f",
-                        gap_hours,
-                        temp_drop,
-                        penalty,
-                    )
-
-        return base_cost + heat_loss_penalty
-
-    def _build_schedule(self, window: tuple[datetime, datetime]) -> dict[str, str]:
-        """Build schedule dict for DHW service."""
-        start_time, end_time = window
-
-        # Convert UTC times to local timezone for the schedule
-        # (BSBLan operates in local time)
-        start_time_local = dt_util.as_local(start_time)
-        end_time_local = dt_util.as_local(end_time)
-
-        # Format: "HH:MM-HH:MM"
-        time_range = (
-            f"{start_time_local.strftime('%H:%M')}-{end_time_local.strftime('%H:%M')}"
-        )
-
-        # Determine which day(s) the schedule applies to
-        schedule: dict[str, str] = {}
-
-        current_date = start_time_local.date()
-        end_date = end_time_local.date()
-
-        # Handle schedule spanning multiple days
-        if current_date == end_date:
-            day_name = start_time_local.strftime("%A").lower()
-            schedule[day_name] = time_range
-        else:
-            # Start day gets start time to midnight
-            day_name = start_time_local.strftime("%A").lower()
-            schedule[day_name] = f"{start_time_local.strftime('%H:%M')}-23:59"
-
-            # End day gets midnight to end time
-            day_name = end_time_local.strftime("%A").lower()
-            schedule[day_name] = f"00:00-{end_time_local.strftime('%H:%M')}"
-
-        return schedule
-
-    def _calculate_cost(
-        self,
-        prices: list[tuple[datetime, float]],
-        window: tuple[datetime, datetime],
-    ) -> float:
-        """Calculate estimated cost for the heating window."""
-        start_time, end_time = window
-
-        total_cost = 0.0
-        for timestamp, price in prices:
-            if start_time <= timestamp < end_time:
-                # Assume 1 kWh per hour (this is a simplification)
-                total_cost += price
-
-        return total_cost
 
     async def _apply_schedule_to_device(self, schedule: dict[str, str]) -> None:
         """Apply the calculated schedule to the target water heater entity."""

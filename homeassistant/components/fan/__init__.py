@@ -61,6 +61,7 @@ DIRECTION_FORWARD = "forward"
 DIRECTION_REVERSE = "reverse"
 
 ATTR_PERCENTAGE = "percentage"
+ATTR_PERCENTAGE_OPTIONS = "percentage_options"
 ATTR_PERCENTAGE_STEP = "percentage_step"
 ATTR_OSCILLATING = "oscillating"
 ATTR_DIRECTION = "direction"
@@ -190,6 +191,7 @@ class FanEntityDescription(ToggleEntityDescription, frozen_or_thawed=True):
 
 CACHED_PROPERTIES_WITH_ATTR_ = {
     "percentage",
+    "percentage_options",
     "speed_count",
     "current_direction",
     "oscillating",
@@ -202,12 +204,15 @@ CACHED_PROPERTIES_WITH_ATTR_ = {
 class FanEntity(ToggleEntity, cached_properties=CACHED_PROPERTIES_WITH_ATTR_):
     """Base class for fan entities."""
 
-    _entity_component_unrecorded_attributes = frozenset({ATTR_PRESET_MODES})
+    _entity_component_unrecorded_attributes = frozenset(
+        {ATTR_PERCENTAGE_OPTIONS, ATTR_PRESET_MODES}
+    )
 
     entity_description: FanEntityDescription
     _attr_current_direction: str | None = None
     _attr_oscillating: bool | None = None
     _attr_percentage: int | None = 0
+    _attr_percentage_options: list[int] | None = None
     _attr_preset_mode: str | None = None
     _attr_preset_modes: list[str] | None = None
     _attr_speed_count: int = 100
@@ -346,6 +351,11 @@ class FanEntity(ToggleEntity, cached_properties=CACHED_PROPERTIES_WITH_ATTR_):
         return self._attr_percentage
 
     @cached_property
+    def percentage_options(self) -> list[int] | None:
+        """Return a list of available percentage options."""
+        return self._attr_percentage_options
+
+    @cached_property
     def speed_count(self) -> int:
         """Return the number of speeds the fan supports."""
         return self._attr_speed_count
@@ -366,10 +376,14 @@ class FanEntity(ToggleEntity, cached_properties=CACHED_PROPERTIES_WITH_ATTR_):
         return self._attr_oscillating
 
     @property
-    def capability_attributes(self) -> dict[str, list[str] | None]:
+    def capability_attributes(self) -> dict[str, Any]:
         """Return capability attributes."""
-        attrs = {}
+        attrs: dict[str, Any] = {}
         supported_features = self.supported_features
+
+        if FanEntityFeature.SET_SPEED in supported_features:
+            if (percentage_options := self.percentage_options) is not None:
+                attrs[ATTR_PERCENTAGE_OPTIONS] = percentage_options
 
         if (
             FanEntityFeature.SET_SPEED in supported_features

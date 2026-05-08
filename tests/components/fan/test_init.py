@@ -3,6 +3,7 @@
 import pytest
 
 from homeassistant.components.fan import (
+    ATTR_PERCENTAGE_OPTIONS,
     ATTR_PRESET_MODE,
     ATTR_PRESET_MODES,
     DOMAIN,
@@ -31,6 +32,7 @@ def test_fanentity() -> None:
     """Test fan entity methods."""
     fan = BaseFan()
     assert fan.state == "off"
+    assert fan.percentage_options is None
     assert fan.preset_modes is None
     assert fan.supported_features == 0
     assert fan.percentage_step == 1
@@ -56,6 +58,7 @@ async def test_async_fanentity(hass: HomeAssistant) -> None:
     fan = BaseFan()
     fan.hass = hass
     assert fan.state == "off"
+    assert fan.percentage_options is None
     assert fan.preset_modes is None
     assert fan.supported_features == 0
     assert fan.percentage_step == 1
@@ -86,17 +89,27 @@ async def test_async_fanentity(hass: HomeAssistant) -> None:
         ("current_direction", "forward"),
         ("oscillating", True),
         ("percentage", 50),
+        ("percentage_options", [25, 50, 75, 100]),
         ("preset_mode", "medium"),
         ("preset_modes", ["low", "medium", "high"]),
         ("speed_count", 50),
         ("supported_features", 1),
     ],
 )
-def test_fanentity_attributes(attribute_name, attribute_value) -> None:
+def test_fanentity_attributes(attribute_name: str, attribute_value: object) -> None:
     """Test fan entity attribute shorthand."""
     fan = BaseFan()
     setattr(fan, f"_attr_{attribute_name}", attribute_value)
     assert getattr(fan, attribute_name) == attribute_value
+
+
+def test_fanentity_percentage_options_capability() -> None:
+    """Test fan entity percentage options capability."""
+    fan = BaseFan()
+    fan._attr_percentage_options = [25, 50, 75, 100]
+    fan._attr_supported_features = FanEntityFeature.SET_SPEED
+
+    assert fan.capability_attributes[ATTR_PERCENTAGE_OPTIONS] == [25, 50, 75, 100]
 
 
 async def test_preset_mode_validation(

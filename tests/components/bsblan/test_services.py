@@ -682,6 +682,26 @@ async def test_sync_time_service(
     mock_bsblan.set_time.assert_called_once_with(current_time_str)
 
 
+async def test_sync_time_service_rejects_water_heater_device(
+    hass: HomeAssistant,
+    mock_bsblan: MagicMock,
+    water_heater_device_entry: dr.DeviceEntry,
+) -> None:
+    """Test the sync_time service rejects a water heater sub-device."""
+    with pytest.raises(ServiceValidationError) as exc:
+        await hass.services.async_call(
+            DOMAIN,
+            "sync_time",
+            {"device_id": water_heater_device_entry.id},
+            blocking=True,
+        )
+
+    assert exc.value.translation_domain == DOMAIN
+    assert exc.value.translation_key == "sync_time_main_device_required"
+    assert not mock_bsblan.time.called
+    assert not mock_bsblan.set_time.called
+
+
 async def test_sync_time_service_no_update_when_same(
     hass: HomeAssistant,
     mock_config_entry: MockConfigEntry,

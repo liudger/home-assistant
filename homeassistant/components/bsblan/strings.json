@@ -160,6 +160,9 @@
     "sync_time_failed": {
       "message": "Failed to sync time for {device_name}: {error}"
     },
+    "sync_time_main_device_required": {
+      "message": "Time sync can only target the main BSB-LAN device"
+    },
     "sync_time_unsupported": {
       "message": "Time sync is not supported for {device_name}"
     }

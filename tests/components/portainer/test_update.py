@@ -24,7 +24,9 @@ from pytest_homeassistant.common import (
     MockConfigEntry,
     async_fire_time_changed,
     async_load_json_array_fixture,
+    async_mock_restore_state_shutdown_restart,
     load_json_value_fixture,
+    mock_restore_cache,
     snapshot_platform,
 )
 from syrupy.assertion import SnapshotAssertion
@@ -36,6 +38,7 @@ from homeassistant.components.update import (
     ATTR_INSTALLED_VERSION,
     ATTR_LATEST_VERSION,
     ATTR_RELEASE_URL,
+    ATTR_SKIPPED_VERSION,
     ATTR_UPDATE_PERCENTAGE,
 )
 from homeassistant.config_entries import SOURCE_REAUTH
@@ -46,7 +49,7 @@ from homeassistant.const import (
     STATE_UNKNOWN,
     Platform,
 )
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, State
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
@@ -407,6 +410,7 @@ async def test_update_installed_version_without_repo_digest(
     state = hass.states.get(ENTITY_ID)
     assert state is not None
     assert state.attributes[ATTR_INSTALLED_VERSION] is None
+    assert state.state == STATE_UNKNOWN
 
 
 async def test_update_using_cache(
@@ -416,7 +420,7 @@ async def test_update_using_cache(
     mock_config_entry: MockConfigEntry,
 ) -> None:
     """Test that the update entity uses the cache and doesn't call the API."""
-    mock_portainer_watcher.last_check = 1234
+    await _watch_all_containers(hass, mock_portainer_watcher)
 
     with (
         patch(
@@ -465,6 +469,357 @@ async def _watch_all_containers(hass: HomeAssistant, watcher: MagicMock) -> None
     watcher.last_check = 1234
 
 
+async def test_update_matches_second_repo_digest(
+    hass: HomeAssistant,
+    mock_portainer_client: AsyncMock,
+    mock_portainer_watcher: MagicMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """An image already containing the registry digest has no update."""
+    await _watch_all_containers(hass, mock_portainer_watcher)
+    mock_portainer_client.get_image.return_value.repo_digests = [
+        "example.com/image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        f"other.example/image@{INSTALLED_DIGEST}",
+    ]
+    for result in mock_portainer_watcher.results.values():
+        result.status.registry_digest = INSTALLED_DIGEST
+
+    with patch("homeassistant.components.portainer._PLATFORMS", [Platform.UPDATE]):
+        await setup_integration(hass, mock_config_entry)
+
+    assert (state := hass.states.get(ENTITY_ID))
+    assert state.state == STATE_OFF
+    assert state.attributes[ATTR_INSTALLED_VERSION] == INSTALLED_DIGEST
+    assert state.attributes[ATTR_LATEST_VERSION] == INSTALLED_DIGEST
+
+    with pytest.raises(HomeAssistantError) as err:
+        await hass.services.async_call(
+            "update", "install", {"entity_id": ENTITY_ID}, blocking=True
+        )
+    assert err.value.translation_key == "no_update_available"
+    mock_portainer_client.container_recreate.assert_not_called()
+    with pytest.raises(HomeAssistantError) as err:
+        await hass.services.async_call(
+            "update", "skip", {"entity_id": ENTITY_ID}, blocking=True
+        )
+    assert err.value.translation_key == "no_update_available_to_skip"
+
+
+async def test_update_distinguishes_digests_with_same_prefix(
+    hass: HomeAssistant,
+    mock_portainer_client: AsyncMock,
+    mock_portainer_watcher: MagicMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Different full digests with equal short prefixes still offer an update."""
+    await _watch_all_containers(hass, mock_portainer_watcher)
+    different_digest = (
+        "sha256:afcc7f1ac1b40000000000000000000000000000000000000000000000000000"
+    )
+    for result in mock_portainer_watcher.results.values():
+        result.status.registry_digest = different_digest
+
+    with patch("homeassistant.components.portainer._PLATFORMS", [Platform.UPDATE]):
+        await setup_integration(hass, mock_config_entry)
+
+    assert (state := hass.states.get(ENTITY_ID))
+    assert state.state == STATE_ON
+    assert state.attributes[ATTR_INSTALLED_VERSION] == INSTALLED_DIGEST
+    assert state.attributes[ATTR_LATEST_VERSION] == different_digest
+
+    await hass.services.async_call(
+        "update", "install", {"entity_id": ENTITY_ID}, blocking=True
+    )
+    mock_portainer_client.container_recreate.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("repo_digests", "registry_digest", "installed", "latest", "expected_state"),
+    [
+        pytest.param(
+            [f"example/image@{INSTALLED_DIGEST}", "other/image@sha256:other"],
+            INSTALLED_DIGEST,
+            INSTALLED_DIGEST,
+            INSTALLED_DIGEST,
+            STATE_OFF,
+            id="first-match",
+        ),
+        pytest.param(
+            [
+                "image@sha256:afcc7f1ac1b40000000000000000000000000000000000000000000000000000",
+                f"image@{INSTALLED_DIGEST}",
+            ],
+            INSTALLED_DIGEST,
+            INSTALLED_DIGEST,
+            INSTALLED_DIGEST,
+            STATE_OFF,
+            id="second-match-same-prefix",
+        ),
+        pytest.param(
+            [f"example/image@{INSTALLED_DIGEST}", "other/image@sha256:other"],
+            "sha256:new",
+            INSTALLED_DIGEST,
+            "sha256:new",
+            STATE_ON,
+            id="mismatch",
+        ),
+        pytest.param(
+            ["malformed", "example/image@", f"valid/image@{INSTALLED_DIGEST}"],
+            "sha256:new",
+            INSTALLED_DIGEST,
+            "sha256:new",
+            STATE_ON,
+            id="first-nonempty-digest",
+        ),
+        pytest.param(
+            [
+                "image@not-a-digest",
+                "image@sha256:",
+                "image@:abcdef",
+                f"valid/image@{INSTALLED_DIGEST}",
+            ],
+            "sha256:new",
+            INSTALLED_DIGEST,
+            "sha256:new",
+            STATE_ON,
+            id="skip-incomplete-digests",
+        ),
+        pytest.param(
+            ["malformed", "example/image@"],
+            "sha256:new",
+            None,
+            "sha256:new",
+            STATE_UNKNOWN,
+            id="no-valid-digests",
+        ),
+        pytest.param(
+            [f"example/image@{INSTALLED_DIGEST}"],
+            None,
+            INSTALLED_DIGEST,
+            None,
+            STATE_UNKNOWN,
+            id="missing-registry-digest",
+        ),
+        pytest.param(
+            [f"example/image@{INSTALLED_DIGEST}"],
+            "",
+            INSTALLED_DIGEST,
+            None,
+            STATE_UNKNOWN,
+            id="empty-registry-digest",
+        ),
+        pytest.param(
+            [], "sha256:new", None, "sha256:new", STATE_UNKNOWN, id="no-local-digest"
+        ),
+    ],
+)
+async def test_update_digest_states(
+    hass: HomeAssistant,
+    mock_portainer_client: AsyncMock,
+    mock_portainer_watcher: MagicMock,
+    mock_config_entry: MockConfigEntry,
+    repo_digests: list[str],
+    registry_digest: str | None,
+    installed: str | None,
+    latest: str | None,
+    expected_state: str,
+) -> None:
+    """Report matching, fallback and unknown digest states consistently."""
+    await _watch_all_containers(hass, mock_portainer_watcher)
+    mock_portainer_client.get_image.return_value.repo_digests = repo_digests
+    for result in mock_portainer_watcher.results.values():
+        result.status.registry_digest = registry_digest
+
+    with patch("homeassistant.components.portainer._PLATFORMS", [Platform.UPDATE]):
+        await setup_integration(hass, mock_config_entry)
+
+    assert (state := hass.states.get(ENTITY_ID))
+    assert state.state == expected_state
+    assert state.attributes[ATTR_INSTALLED_VERSION] == installed
+    assert state.attributes[ATTR_LATEST_VERSION] == latest
+
+
+@pytest.mark.parametrize(
+    "registry_digest",
+    [
+        "sha256:afcc7f1ac1b40000000000000000000000000000000000000000000000000000",
+        "sha256:afcc7f1ac1b41111111111111111111111111111111111111111111111111111",
+    ],
+    ids=["possible-skipped-digest", "same-prefix-new-digest"],
+)
+async def test_update_legacy_short_skip_is_not_restored(
+    hass: HomeAssistant,
+    mock_portainer_client: AsyncMock,
+    mock_portainer_watcher: MagicMock,
+    mock_config_entry: MockConfigEntry,
+    registry_digest: str,
+) -> None:
+    """A short skip cannot identify which full digest was previously skipped."""
+    await _watch_all_containers(hass, mock_portainer_watcher)
+    mock_portainer_client.get_image.return_value.repo_digests = [
+        "example/image@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    ]
+    for result in mock_portainer_watcher.results.values():
+        result.status.registry_digest = registry_digest
+    mock_restore_cache(
+        hass,
+        [
+            State(
+                ENTITY_ID,
+                STATE_OFF,
+                {
+                    ATTR_INSTALLED_VERSION: "sha256:bbbbbbbbbbbb",
+                    ATTR_LATEST_VERSION: "sha256:afcc7f1ac1b4",
+                    ATTR_SKIPPED_VERSION: "sha256:afcc7f1ac1b4",
+                },
+            )
+        ],
+    )
+
+    with patch("homeassistant.components.portainer._PLATFORMS", [Platform.UPDATE]):
+        await setup_integration(hass, mock_config_entry)
+
+    assert (state := hass.states.get(ENTITY_ID))
+    assert state.state == STATE_ON
+    assert state.attributes[ATTR_LATEST_VERSION] == registry_digest
+    assert state.attributes[ATTR_SKIPPED_VERSION] is None
+
+
+async def test_update_full_skip_survives_restore(
+    hass: HomeAssistant,
+    hass_storage: dict[str, Any],
+    mock_portainer_client: AsyncMock,
+    mock_portainer_watcher: MagicMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """A full digest skip survives saving and restoring the update entity."""
+    await _watch_all_containers(hass, mock_portainer_watcher)
+    registry_digest = (
+        "sha256:afcc7f1ac1b40000000000000000000000000000000000000000000000000000"
+    )
+    for result in mock_portainer_watcher.results.values():
+        result.status.registry_digest = registry_digest
+
+    with patch("homeassistant.components.portainer._PLATFORMS", [Platform.UPDATE]):
+        await setup_integration(hass, mock_config_entry)
+        await hass.services.async_call(
+            "update", "skip", {"entity_id": ENTITY_ID}, blocking=True
+        )
+        assert (state := hass.states.get(ENTITY_ID))
+        assert state.state == STATE_OFF
+        assert state.attributes[ATTR_SKIPPED_VERSION] == registry_digest
+
+        await async_mock_restore_state_shutdown_restart(hass)
+        stored = next(
+            item["state"]
+            for item in hass_storage["core.restore_state"]["data"]
+            if item["state"]["entity_id"] == ENTITY_ID
+        )
+        assert stored["attributes"][ATTR_SKIPPED_VERSION] == registry_digest
+        assert await hass.config_entries.async_unload(mock_config_entry.entry_id)
+        assert await hass.config_entries.async_setup(mock_config_entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert (state := hass.states.get(ENTITY_ID))
+    assert state.state == STATE_OFF
+    assert state.attributes[ATTR_LATEST_VERSION] == registry_digest
+    assert state.attributes[ATTR_SKIPPED_VERSION] == registry_digest
+
+
+async def test_update_skip_tracks_full_registry_digest(
+    hass: HomeAssistant,
+    mock_portainer_client: AsyncMock,
+    mock_portainer_watcher: MagicMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """A new digest with the same prefix is not hidden by a previous skip."""
+    await _watch_all_containers(hass, mock_portainer_watcher)
+    first = "sha256:afcc7f1ac1b40000000000000000000000000000000000000000000000000000"
+    second = "sha256:afcc7f1ac1b41111111111111111111111111111111111111111111111111111"
+    for result in mock_portainer_watcher.results.values():
+        result.status.registry_digest = first
+    with patch("homeassistant.components.portainer._PLATFORMS", [Platform.UPDATE]):
+        await setup_integration(hass, mock_config_entry)
+
+    await hass.services.async_call(
+        "update", "skip", {"entity_id": ENTITY_ID}, blocking=True
+    )
+    assert (state := hass.states.get(ENTITY_ID))
+    assert state.state == STATE_OFF
+    assert state.attributes[ATTR_SKIPPED_VERSION] == first
+
+    for result in mock_portainer_watcher.results.values():
+        result.status.registry_digest = second
+    coordinator = mock_config_entry.runtime_data
+    coordinator.async_set_updated_data(coordinator.data)
+    await hass.async_block_till_done()
+
+    assert (state := hass.states.get(ENTITY_ID))
+    assert state.state == STATE_ON
+    assert state.attributes[ATTR_LATEST_VERSION] == second
+    assert state.attributes[ATTR_SKIPPED_VERSION] is None
+
+    await hass.services.async_call(
+        "update", "skip", {"entity_id": ENTITY_ID}, blocking=True
+    )
+    mock_portainer_client.get_image.return_value.repo_digests.append(f"image@{second}")
+    coordinator.async_set_updated_data(coordinator.data)
+    await hass.async_block_till_done()
+
+    assert (state := hass.states.get(ENTITY_ID))
+    assert state.state == STATE_OFF
+    assert state.attributes[ATTR_INSTALLED_VERSION] == second
+    assert state.attributes[ATTR_SKIPPED_VERSION] is None
+
+
+async def test_update_without_registry_status_cannot_install_or_skip(
+    hass: HomeAssistant,
+    mock_portainer_client: AsyncMock,
+    mock_portainer_watcher: MagicMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Keep the update unknown when the watcher has not checked the container."""
+    mock_portainer_watcher.results = {}
+    with patch("homeassistant.components.portainer._PLATFORMS", [Platform.UPDATE]):
+        await setup_integration(hass, mock_config_entry)
+
+    assert (state := hass.states.get(ENTITY_ID))
+    assert state.state == STATE_UNKNOWN
+    assert state.attributes[ATTR_INSTALLED_VERSION] == INSTALLED_DIGEST
+    assert state.attributes[ATTR_LATEST_VERSION] is None
+    with pytest.raises(HomeAssistantError) as err:
+        await hass.services.async_call(
+            "update", "install", {"entity_id": ENTITY_ID}, blocking=True
+        )
+    assert err.value.translation_key == "no_update_available"
+    with pytest.raises(HomeAssistantError) as err:
+        await hass.services.async_call(
+            "update", "skip", {"entity_id": ENTITY_ID}, blocking=True
+        )
+    assert err.value.translation_key == "unknown_version_to_skip"
+    mock_portainer_client.container_recreate.assert_not_called()
+
+
+async def test_update_with_unknown_installed_version_can_install(
+    hass: HomeAssistant,
+    mock_portainer_client: AsyncMock,
+    mock_portainer_watcher: MagicMock,
+    mock_config_entry: MockConfigEntry,
+) -> None:
+    """Preserve Home Assistant's install behavior when only latest is known."""
+    await _watch_all_containers(hass, mock_portainer_watcher)
+    mock_portainer_client.get_image.return_value.repo_digests = []
+    with patch("homeassistant.components.portainer._PLATFORMS", [Platform.UPDATE]):
+        await setup_integration(hass, mock_config_entry)
+
+    assert (state := hass.states.get(ENTITY_ID))
+    assert state.state == STATE_UNKNOWN
+    await hass.services.async_call(
+        "update", "install", {"entity_id": ENTITY_ID}, blocking=True
+    )
+    mock_portainer_client.container_recreate.assert_called_once()
+
+
 async def _recreate_container(hass: HomeAssistant, client: AsyncMock) -> None:
     """Give the funny_chatelet container a new ID, as a recreate does."""
     containers = cast(
@@ -489,6 +844,10 @@ async def test_update_recreated_container(
 ) -> None:
     """Test a recreated container gets its image checked instead of staying unknown."""
     await _watch_all_containers(hass, mock_portainer_watcher)
+    mock_portainer_client.get_image.return_value.repo_digests = [
+        "other/image@sha256:other",
+        f"example/image@{INSTALLED_DIGEST}",
+    ]
 
     with patch(
         "homeassistant.components.portainer._PLATFORMS",
@@ -520,7 +879,8 @@ async def test_update_recreated_container(
     state = hass.states.get(ENTITY_ID)
     assert state is not None
     assert state.state == STATE_OFF
-    assert state.attributes[ATTR_LATEST_VERSION] == "sha256:afcc7f1ac1b4"
+    assert state.attributes[ATTR_INSTALLED_VERSION] == INSTALLED_DIGEST
+    assert state.attributes[ATTR_LATEST_VERSION] == INSTALLED_DIGEST
 
     # The result is kept until the watcher runs again, not fetched every poll
     freezer.tick(DEFAULT_SCAN_INTERVAL)

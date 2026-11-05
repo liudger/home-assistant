@@ -43,7 +43,9 @@ _LOGGER = logging.getLogger(__name__)
 class PortainerContainerUpdateEntityDescription(UpdateEntityDescription):
     """Describes Portainer container update entity."""
 
-    installed_version: Callable[[LocalImageInformation], str | None]
+    installed_version: Callable[
+        [LocalImageInformation, PortainerImageUpdateStatus | None], str | None
+    ]
     latest_version: Callable[[PortainerImageUpdateStatus | None], str | None]
 
 
@@ -53,10 +55,22 @@ DEFAULT_RECREATE_TIMEOUT = timedelta(minutes=10)
 PULL_PERCENTAGE = 90
 
 
-def _short_digest(digest: str) -> str:
-    """Shorten a digest to its algorithm and the leading hex characters."""
-    algorithm, separator, hex_digest = digest.partition(":")
-    return f"{algorithm}{separator}{hex_digest[:12]}"
+def _installed_digest(
+    image: LocalImageInformation, status: PortainerImageUpdateStatus | None
+) -> str | None:
+    """Prefer the local digest that matches the registry, if present."""
+    registry_digest = status.registry_digest if status is not None else None
+    first_digest = None
+    for repo_digest in image.repo_digests or ():
+        digest = repo_digest.partition("@")[2]
+        algorithm, separator, value = digest.partition(":")
+        if not (algorithm and separator and value):
+            continue
+        if digest == registry_digest:
+            return digest
+        if first_digest is None:
+            first_digest = digest
+    return first_digest
 
 
 CONTAINER_IMAGE: tuple[PortainerContainerUpdateEntityDescription] = (
@@ -64,15 +78,9 @@ CONTAINER_IMAGE: tuple[PortainerContainerUpdateEntityDescription] = (
         key="container_image_update",
         translation_key="container_image_update",
         entity_category=EntityCategory.CONFIG,
-        installed_version=lambda data: (
-            _short_digest(data.repo_digests[0].partition("@")[2])
-            if data.repo_digests
-            else None
-        ),
+        installed_version=_installed_digest,
         latest_version=lambda data: (
-            _short_digest(digest)
-            if data is not None and (digest := data.registry_digest)
-            else None
+            data.registry_digest or None if data is not None else None
         ),
     ),
 )
@@ -182,7 +190,7 @@ class PortainerContainerImageUpdateEntity(PortainerContainerEntity, UpdateEntity
     def installed_version(self) -> str | None:
         """Return installed version."""
         return self.entity_description.installed_version(
-            self.container_data.local_image
+            self.container_data.local_image, self.container_data.image_status
         )
 
     @override
@@ -190,6 +198,14 @@ class PortainerContainerImageUpdateEntity(PortainerContainerEntity, UpdateEntity
     def latest_version(self) -> str | None:
         """Return latest version."""
         return self.entity_description.latest_version(self.container_data.image_status)
+
+    @override
+    @property
+    def has_update(self) -> bool:
+        """Compare digests as opaque identities, not ordered versions."""
+        installed = self.installed_version
+        latest = self.latest_version
+        return installed is not None and latest is not None and installed != latest
 
     @override
     async def async_install(
